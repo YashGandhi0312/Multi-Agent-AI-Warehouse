@@ -7,6 +7,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import type { WarehouseState } from '../types';
 import * as api from '../services/api';
+import { BacktrackingPanel } from '../components/BacktrackingPanel';
 import { Play, RotateCcw, Cpu, CheckCircle2, Zap, ArrowRight, ShieldCheck } from 'lucide-react';
 
 interface AlgorithmExplorerProps {
@@ -438,6 +439,8 @@ export const AlgorithmExplorer: React.FC<AlgorithmExplorerProps> = ({ state }) =
             Click <strong>"Compare A* vs BFS"</strong> above to generate real-time metrics for this grid layout.
           </div>
         )}
+
+        <BacktrackingPanel state={state} />
 
         {/* Theoretical Highlights for Evaluators */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>

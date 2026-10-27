@@ -6,12 +6,14 @@ Orchestrates all classical AI components to run the warehouse simulation.
 Each simulation step follows this sequence:
   1. Process pending environment changes (new obstacles, packages, etc.)
   2. Evaluate applicable robot rules (rule-based reasoning)
-  3. Allocate tasks to available robots (greedy min-cost allocation)
-  4. Plan or replan routes when necessary (A* / Cooperative A*)
+  3. Allocate tasks to available robots (backtracking branch & bound)
+  4. Plan or replan routes (Cooperative A* with priority-order backtracking)
   5. Validate all planned movements against shared constraints
   6. Execute robot movements simultaneously
   7. Update package states
   8. Update robot states
+  8b. Agent monitoring: detect stuck robots / wait-for deadlocks and
+      backtrack to the most recent choice point (route → task)
   9. Update statistics
   10. Broadcast the resulting state to the frontend (via callback)
 """
@@ -26,12 +28,13 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from agents.robot import Robot, RobotState, create_robot
 from algorithms.astar import astar_search, AStarResult
 from algorithms.cooperative_astar import (
-    ReservationTable, cooperative_astar, plan_all_robots
+    ReservationTable, cooperative_astar
+)
+from algorithms.backtracking import (
+    backtracking_allocate, plan_with_order_backtracking
 )
 from algorithms.rule_engine import RuleEngine, get_rule_engine
-from algorithms.task_allocation import (
-    Task, allocate_tasks, build_cost_matrix
-)
+from algorithms.task_allocation import Task
 from simulation.warehouse import Warehouse, Package, create_default_warehouse
 
 
@@ -49,6 +52,14 @@ class Statistics:
         self.replan_count: int = 0
         self.delivery_step_totals: List[int] = []
         self.simulation_step: int = 0
+        # Backtracking search
+        self.search_nodes: int = 0
+        self.branches_pruned: int = 0
+        self.search_backtracks: int = 0
+        self.allocation_cost_saved: float = 0.0
+        self.ordering_resolutions: int = 0
+        self.agent_backtracks: int = 0
+        self.deadlocks_resolved: int = 0
     
     @property
     def pending_deliveries(self) -> int:
@@ -73,6 +84,13 @@ class Statistics:
             "nodes_explored": self.nodes_explored,
             "replan_count": self.replan_count,
             "simulation_step": self.simulation_step,
+            "search_nodes": self.search_nodes,
+            "branches_pruned": self.branches_pruned,
+            "search_backtracks": self.search_backtracks,
+            "allocation_cost_saved": round(self.allocation_cost_saved, 1),
+            "ordering_resolutions": self.ordering_resolutions,
+            "agent_backtracks": self.agent_backtracks,
+            "deadlocks_resolved": self.deadlocks_resolved,
         }
 
 
@@ -109,6 +127,17 @@ class EventLog:
         self.entries.clear()
 
 
+# Agent backtracking parameters
+STUCK_THRESHOLD = 5          # steps without progress before backtracking
+MAX_ROUTE_ALTERNATIVES = 2   # alternative routes tried before dropping the task
+NOGOOD_TTL = 30              # steps a (robot, task) pair stays forbidden
+BACKTRACK_COOLDOWN = 3       # steps between two backtracks of the same robot
+ACTIVE_STATES = (
+    RobotState.MOVING_TO_PICKUP, RobotState.MOVING_TO_DELIVERY,
+    RobotState.WAITING, RobotState.REPLANNING, RobotState.BLOCKED,
+)
+
+
 class SimulationEngine:
     """
     The main simulation orchestrator.
@@ -129,7 +158,7 @@ class SimulationEngine:
         self.is_running: bool = False
         self.speed: float = 1.0  # Steps per second multiplier
         self.simulation_step: int = 0
-        self.active_algorithm: str = "Cooperative A*"
+        self.active_algorithm: str = "Cooperative A* + Backtracking"
         
         self._broadcast_callback: Optional[Callable] = None
         self._step_task: Optional[asyncio.Task] = None
@@ -139,6 +168,13 @@ class SimulationEngine:
         
         # Track tasks that were active at the start of delivery for step counting
         self._task_start_steps: Dict[str, int] = {}
+        
+        # Backtracking state: (robot_id, task_id) → step until which forbidden
+        self.nogoods: Dict[Tuple[str, str], int] = {}
+        # Tasks no robot can currently reach: task_id → step until deferred
+        self.deferred_tasks: Dict[str, int] = {}
+        self.last_allocation_search: Optional[Dict] = None
+        self.last_ordering_search: Optional[Dict] = None
         
         # Initialize default robots
         self._initialize_default_robots()
@@ -193,6 +229,10 @@ class SimulationEngine:
         self._task_counter = 1
         self._robot_counter = 6
         self._task_start_steps.clear()
+        self.nogoods.clear()
+        self.deferred_tasks.clear()
+        self.last_allocation_search = None
+        self.last_ordering_search = None
         self.event_log.clear()
         
         self._initialize_default_robots()
@@ -306,14 +346,21 @@ class SimulationEngine:
         
         if available_robots and pending_tasks_exist:
             tasks_list = list(self.tasks.values())
-            allocations = allocate_tasks(
+            self.nogoods = {k: v for k, v in self.nogoods.items() if v > step}
+            self.deferred_tasks = {k: v for k, v in self.deferred_tasks.items() if v > step}
+            forbidden = set(self.nogoods) | {
+                (rid, tid) for tid in self.deferred_tasks for rid in available_robots
+            }
+            allocations, search = backtracking_allocate(
                 tasks_list,
                 robot_positions,
                 available_robots,
                 self.warehouse.grid_width,
                 self.warehouse.grid_height,
                 self.warehouse.get_all_obstacles(),
+                forbidden_pairs=forbidden,
             )
+            self._record_allocation_search(search, step)
             
             for alloc in allocations:
                 robot = self.robots.get(alloc.robot_id)
@@ -330,6 +377,7 @@ class SimulationEngine:
                         pkg.assigned_robot = alloc.robot_id
                     task.status = "ASSIGNED"
                     self._task_start_steps[task.task_id] = step
+                    robot.push_choice("TASK", task_id=task.task_id)
                     
                     self.event_log.log(
                         "TASK_ASSIGNED",
@@ -374,11 +422,12 @@ class SimulationEngine:
                         "robot_id": robot_id,
                         "start": robot.position,
                         "goal": target,
+                        "avoid": robot.avoid_cells - {target},
                     })
             
             if plan_inputs:
                 t_plan_start = time.perf_counter()
-                results = plan_all_robots(
+                results, ordering = plan_with_order_backtracking(
                     plan_inputs,
                     self.warehouse.grid_width,
                     self.warehouse.grid_height,
@@ -388,6 +437,7 @@ class SimulationEngine:
                 )
                 plan_time = (time.perf_counter() - t_plan_start) * 1000
                 self.statistics.total_planning_time_ms += plan_time
+                self._record_ordering_search(ordering, step)
                 
                 for result in results:
                     robot = self.robots.get(result.robot_id)
@@ -398,6 +448,9 @@ class SimulationEngine:
                     
                     if result.success:
                         robot.set_path(result.path, result.time_path)
+                        top = robot.top_choice()
+                        if top is None or top["level"] != "ROUTE":
+                            robot.push_choice("ROUTE")
                         if robot.state == RobotState.ASSIGNED:
                             robot.transition_to(RobotState.MOVING_TO_PICKUP)
                         elif robot.state == RobotState.REPLANNING:
@@ -415,6 +468,11 @@ class SimulationEngine:
                         )
                     else:
                         robot.force_state(RobotState.BLOCKED)
+                        # A failed plan is still a route choice: the agent
+                        # retries it before backtracking further to the task
+                        top = robot.top_choice()
+                        if top is None or top["level"] != "ROUTE":
+                            robot.push_choice("ROUTE")
                         self.event_log.log(
                             "BLOCKED",
                             f"Robot {result.robot_id} has no valid path: {result.message}",
@@ -422,6 +480,7 @@ class SimulationEngine:
                         )
         
         # ── STEP 5 & 6: Validate and execute movements ───────────────────────
+        positions_before = {rid: r.position for rid, r in self.robots.items()}
         planned_moves: Dict[str, Tuple[int, int]] = {}
         
         # Collect all intended moves
@@ -520,6 +579,7 @@ class SimulationEngine:
                     robot.has_package = True
                     robot.path = []
                     robot.time_path = []
+                    robot.commit_task()
                     task = self.tasks.get(robot.task_id)
                     if task:
                         task.status = "IN_PROGRESS"
@@ -559,8 +619,233 @@ class SimulationEngine:
                     step=step,
                 )
         
+        # ── STEP 8b: Agent monitoring and backtracking ────────────────────────
+        self._monitor_agents(robot_rule_actions, positions_before, step)
+        
         # ── STEP 9: Update aggregate statistics ───────────────────────────────
         # (Already updated inline above)
+    
+    # ──────────────────────────────────────────────────────────────────────
+    # BACKTRACKING: SEARCH REPORTS AND AGENT DELIBERATION
+    # ──────────────────────────────────────────────────────────────────────
+    
+    def _record_allocation_search(self, search, step: int):
+        """Fold one branch & bound allocation search into stats and logs."""
+        report = search.to_dict()
+        report["step"] = step
+        self.last_allocation_search = report
+        self.statistics.search_nodes += search.nodes_expanded
+        self.statistics.branches_pruned += search.branches_pruned
+        self.statistics.search_backtracks += search.backtracks
+        if not search.assignment:
+            return
+        saved = report["cost_saved"]
+        self.statistics.allocation_cost_saved += saved
+        self.event_log.log(
+            "ALLOCATION_SEARCH",
+            f"Branch & bound allocation: {search.nodes_expanded} nodes, "
+            f"{search.branches_pruned} pruned, {search.backtracks} backtracks. "
+            f"Joint cost {report['best_cost']} vs greedy {report['greedy_cost']}"
+            + (f" (saved {saved})." if saved > 0 else "."),
+            step=step,
+        )
+    
+    def _record_ordering_search(self, ordering, step: int):
+        """Log priority-order backtracking when the fixed order failed."""
+        if ordering.orderings_tried <= 1 and not ordering.unsolvable:
+            return
+        report = ordering.to_dict()
+        report["step"] = step
+        self.last_ordering_search = report
+        self.statistics.search_backtracks += ordering.backtracks
+        if ordering.resolved_by_backtracking:
+            self.statistics.ordering_resolutions += 1
+            self.event_log.log(
+                "PRIORITY_BACKTRACK",
+                f"Fixed planning order failed; backtracking found order "
+                f"{' → '.join(ordering.final_order)} after {ordering.orderings_tried} "
+                f"orderings ({ordering.ca_calls} CA* calls).",
+                step=step,
+            )
+    
+    def _monitor_agents(self, robot_rule_actions: Dict[str, Dict],
+                        positions_before: Dict[str, Tuple[int, int]], step: int):
+        """
+        Agent self-monitoring. Each robot checks its own progress; when it is
+        stuck (or part of a wait-for cycle) it backtracks to its most recent
+        choice point instead of waiting forever.
+        """
+        for robot_id, robot in self.robots.items():
+            moved = positions_before.get(robot_id) != robot.position
+            if robot.state in ACTIVE_STATES and not moved:
+                robot.stuck_steps += 1
+            else:
+                robot.stuck_steps = 0
+        
+        # Deadlock detection: cycles in the wait-for graph
+        wait_for: Dict[str, str] = {}
+        for robot_id, info in robot_rule_actions.items():
+            action = info.get("action", {})
+            if action.get("type") == "WAIT" and action.get("blocked_by"):
+                wait_for[robot_id] = action["blocked_by"]
+        
+        handled: Set[str] = set()
+        for start in wait_for:
+            chain, node = [], start
+            while node in wait_for and node not in chain:
+                chain.append(node)
+                node = wait_for[node]
+            if node not in chain:
+                continue
+            cycle = chain[chain.index(node):]
+            if handled & set(cycle):
+                continue
+            handled |= set(cycle)
+            # The robot without a package (cheapest to back off) yields first
+            victim = min(
+                cycle,
+                key=lambda rid: (self.robots[rid].has_package, rid),
+            )
+            self.statistics.deadlocks_resolved += 1
+            self.event_log.log(
+                "DEADLOCK_DETECTED",
+                f"Wait-for cycle {' → '.join(cycle + [cycle[0]])}. "
+                f"Robot {victim} backtracks to break it.",
+                robot_id=victim, step=step,
+            )
+            self._agent_backtrack(self.robots[victim], step, force=True)
+        
+        for robot in list(self.robots.values()):
+            if robot.robot_id in handled:
+                continue
+            if robot.state == RobotState.BLOCKED or robot.stuck_steps >= STUCK_THRESHOLD:
+                self._agent_backtrack(robot, step)
+    
+    def _agent_backtrack(self, robot: Robot, step: int, force: bool = False):
+        """
+        Chronological backtracking over the robot's choice points:
+          ROUTE → try an alternative route avoiding the blocked cell
+          TASK  → abandon the task (nogood) or, if carrying, step aside
+        """
+        if not force and step < robot.backtrack_cooldown_until:
+            return
+        robot.backtrack_cooldown_until = step + BACKTRACK_COOLDOWN
+        robot.stuck_steps = 0
+        robot.backtrack_count += 1
+        self.statistics.agent_backtracks += 1
+        
+        while True:
+            choice = robot.top_choice()
+            if choice is None:
+                if robot.task_id is None and robot.state != RobotState.IDLE:
+                    robot.clear_task()
+                    robot.force_state(RobotState.IDLE)
+                return
+            
+            if choice["level"] == "ROUTE":
+                # Alternative routes cannot help if the goal is walled off
+                if (choice["attempts"] < MAX_ROUTE_ALTERNATIVES
+                        and self._target_reachable(robot)):
+                    choice["attempts"] += 1
+                    blocked_cell = robot.path[0] if robot.path else None
+                    if blocked_cell:
+                        robot.avoid_cells.add(blocked_cell)
+                    self._request_replan(robot)
+                    self.event_log.log(
+                        "BACKTRACK",
+                        f"Robot {robot.robot_id} backtracks to ROUTE choice: "
+                        f"alternative route #{choice['attempts']}"
+                        + (f" avoiding {blocked_cell}." if blocked_cell else "."),
+                        robot_id=robot.robot_id, step=step,
+                    )
+                    return
+                robot.pop_choice()
+                robot.avoid_cells.clear()
+                continue
+            
+            # TASK choice point
+            if not robot.has_package:
+                self._abandon_task(robot, step)
+            else:
+                self._yield_cell(robot, step)
+            return
+    
+    def _target_reachable(self, robot: Robot) -> bool:
+        """Static reachability of the robot's current goal, ignoring other robots."""
+        target = robot.delivery_target if robot.has_package else robot.pickup_target
+        if target is None:
+            return False
+        return astar_search(
+            robot.position, target, self.warehouse.grid_width,
+            self.warehouse.grid_height, self.warehouse.get_all_obstacles(),
+        ).success
+    
+    def _request_replan(self, robot: Robot):
+        robot.path = []
+        robot.time_path = []
+        self.reservation_table.clear_robot_reservations(robot.robot_id)
+        robot.force_state(RobotState.REPLANNING)
+        robot.replan_count += 1
+        self.statistics.replan_count += 1
+    
+    def _abandon_task(self, robot: Robot, step: int):
+        """Undo the task assignment and forbid this (robot, task) pair for a while."""
+        task_id = robot.task_id
+        task = self.tasks.get(task_id) if task_id else None
+        unreachable = not self._target_reachable(robot)
+        if task:
+            task.status = "PENDING"
+            task.assigned_robot = None
+            if unreachable:
+                # Nobody can reach it: defer the task for every robot
+                self.deferred_tasks[task_id] = step + NOGOOD_TTL
+            else:
+                self.nogoods[(robot.robot_id, task_id)] = step + NOGOOD_TTL
+            self._task_start_steps.pop(task_id, None)
+        pkg = self.warehouse.get_package(robot.package_id) if robot.package_id else None
+        if pkg and pkg.status in ("WAITING", "ASSIGNED"):
+            pkg.status = "WAITING"
+            pkg.assigned_robot = None
+        self.reservation_table.clear_robot_reservations(robot.robot_id)
+        robot.clear_task()
+        robot.force_state(RobotState.IDLE)
+        reason = ("pickup is unreachable, deferring it for all robots"
+                  if unreachable else
+                  "route alternatives exhausted, releasing it back to the pool")
+        self.event_log.log(
+            "BACKTRACK",
+            f"Robot {robot.robot_id} backtracks to TASK choice for {task_id}: "
+            f"{reason} (nogood for {NOGOOD_TTL} steps).",
+            robot_id=robot.robot_id, step=step,
+        )
+    
+    def _yield_cell(self, robot: Robot, step: int):
+        """A committed (carrying) robot steps aside to let traffic clear."""
+        occupied = {r.position for r in self.robots.values() if r is not robot}
+        x, y = robot.position
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            cell = (x + dx, y + dy)
+            if (self.warehouse.is_traversable(cell) and cell not in occupied
+                    and cell not in robot.avoid_cells):
+                top = robot.top_choice()
+                if top and top["level"] == "ROUTE":
+                    robot.pop_choice()
+                self.reservation_table.clear_robot_reservations(robot.robot_id)
+                robot.path = [cell]
+                robot.time_path = []
+                robot.force_state(RobotState.MOVING_TO_DELIVERY)
+                self.event_log.log(
+                    "BACKTRACK",
+                    f"Robot {robot.robot_id} is committed to {robot.task_id}; "
+                    f"stepping aside to {cell} before replanning.",
+                    robot_id=robot.robot_id, step=step,
+                )
+                return
+        self.event_log.log(
+            "BACKTRACK",
+            f"Robot {robot.robot_id} is committed to {robot.task_id} and boxed in; holding position.",
+            robot_id=robot.robot_id, step=step,
+        )
     
     # ──────────────────────────────────────────────────────────────────────
     # ENVIRONMENT MODIFICATION METHODS
@@ -658,6 +943,9 @@ class SimulationEngine:
         """Remove a dynamic obstacle."""
         result = self.warehouse.remove_obstacle(position)
         if result:
+            # The world changed: learned nogoods may no longer hold
+            self.nogoods.clear()
+            self.deferred_tasks.clear()
             self.event_log.log(
                 "OBSTACLE_REMOVED",
                 f"Obstacle at {position} removed.",
@@ -758,6 +1046,26 @@ class SimulationEngine:
             "event_logs": self.event_log.recent(100),
             "reservation_table": reservation_snap,
             "rules": self.rule_engine.get_rules_summary(),
+            "backtracking": self.get_backtracking_state(include_trace=False),
+        }
+    
+    def get_backtracking_state(self, include_trace: bool = True) -> Dict:
+        """Latest search reports and active nogoods for the UI."""
+        allocation = self.last_allocation_search
+        if allocation and not include_trace:
+            allocation = {k: v for k, v in allocation.items() if k != "trace"}
+        return {
+            "allocation_search": allocation,
+            "ordering_search": self.last_ordering_search,
+            "nogoods": [
+                {"robot_id": r, "task_id": t, "expires_at": exp}
+                for (r, t), exp in self.nogoods.items()
+                if exp > self.simulation_step
+            ] + [
+                {"robot_id": None, "task_id": t, "expires_at": exp}
+                for t, exp in self.deferred_tasks.items()
+                if exp > self.simulation_step
+            ],
         }
     
     async def _broadcast_state(self):

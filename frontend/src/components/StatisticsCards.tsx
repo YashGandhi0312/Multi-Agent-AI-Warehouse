@@ -6,7 +6,7 @@ import React from 'react';
 import type { Statistics } from '../types';
 import {
   TrendingUp, Package, Clock, AlertTriangle,
-  CheckCircle, BarChart2, Zap, Target, Map
+  CheckCircle, BarChart2, Zap, Target, Map, Undo2, GitBranch
 } from 'lucide-react';
 
 interface StatsCardProps {
@@ -116,6 +116,20 @@ export const StatisticsCards: React.FC<StatisticsCardsProps> = ({ stats }) => {
         icon={<Target size={14} />}
         color="#c084fc"
         sub="total"
+      />
+      <StatItem
+        label="Backtracks"
+        value={stats.agent_backtracks ?? 0}
+        icon={<Undo2 size={14} />}
+        color="#f472b6"
+        sub={`${stats.deadlocks_resolved ?? 0} deadlocks broken`}
+      />
+      <StatItem
+        label="B&B Saved"
+        value={(stats.allocation_cost_saved ?? 0).toFixed(0)}
+        icon={<GitBranch size={14} />}
+        color="#34d399"
+        sub={`${stats.branches_pruned ?? 0} branches pruned`}
       />
     </div>
   );

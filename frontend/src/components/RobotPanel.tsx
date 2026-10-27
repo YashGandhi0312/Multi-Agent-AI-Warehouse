@@ -114,6 +114,22 @@ export const RobotPanel: React.FC<RobotPanelProps> = ({
                     <span>Replans</span>
                     <span style={{ color: '#c084fc' }}>{robot.replan_count}</span>
                   </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Backtracks</span>
+                    <span style={{ color: '#f472b6' }}>{robot.backtrack_count ?? 0}</span>
+                  </div>
+                  {robot.decision_stack?.length > 0 && (
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>Choice points</span>
+                      <span style={{ color: '#94a3b8', fontFamily: 'JetBrains Mono, monospace' }}>
+                        {robot.decision_stack.map(c =>
+                          c.level === 'TASK'
+                            ? `${c.label}${c.committed ? '🔒' : ''}`
+                            : `route×${c.attempts}`
+                        ).join(' › ')}
+                      </span>
+                    </div>
+                  )}
                   {robot.has_package && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
                       <Package size={10} style={{ color: '#f59e0b' }} />

@@ -106,3 +106,4 @@ export const compareAlgorithms = (start: [number, number], goal: [number, number
 export const getRules = () => apiRequest('/rules');
 export const getCostMatrix = () => apiRequest('/cost-matrix');
 export const getReservationTable = () => apiRequest('/reservation-table');
+export const getBacktracking = () => apiRequest('/backtracking');

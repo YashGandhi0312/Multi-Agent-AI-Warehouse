@@ -29,6 +29,10 @@ const EVENT_ICONS: Record<string, string> = {
   PACKAGE_ADDED: '📦',
   WAIT: '⏸️',
   SCENARIO_LOADED: '🎬',
+  ALLOCATION_SEARCH: '🌳',
+  PRIORITY_BACKTRACK: '🔀',
+  BACKTRACK: '↩️',
+  DEADLOCK_DETECTED: '⛓️',
 };
 
 export const EventLogs: React.FC<EventLogsProps> = ({ logs }) => {

@@ -29,6 +29,9 @@ class RobotSchema(BaseModel):
     wait_steps: int = 0
     total_steps: int = 0
     replan_count: int = 0
+    stuck_steps: int = 0
+    backtrack_count: int = 0
+    decision_stack: List[Dict] = []
 
 
 class PackageSchema(BaseModel):
@@ -64,6 +67,13 @@ class StatisticsSchema(BaseModel):
     nodes_explored: int = 0
     replan_count: int = 0
     simulation_step: int = 0
+    search_nodes: int = 0
+    branches_pruned: int = 0
+    search_backtracks: int = 0
+    allocation_cost_saved: float = 0.0
+    ordering_resolutions: int = 0
+    agent_backtracks: int = 0
+    deadlocks_resolved: int = 0
 
 
 class EventLogEntry(BaseModel):

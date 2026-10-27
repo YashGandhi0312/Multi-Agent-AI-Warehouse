@@ -34,6 +34,16 @@ export interface Robot {
   wait_steps: number;
   total_steps: number;
   replan_count: number;
+  stuck_steps: number;
+  backtrack_count: number;
+  decision_stack: DecisionPoint[];
+}
+
+export interface DecisionPoint {
+  level: 'TASK' | 'ROUTE';
+  label: string | null;
+  attempts: number;
+  committed: boolean;
 }
 
 export interface Package {
@@ -69,6 +79,13 @@ export interface Statistics {
   nodes_explored: number;
   replan_count: number;
   simulation_step: number;
+  search_nodes: number;
+  branches_pruned: number;
+  search_backtracks: number;
+  allocation_cost_saved: number;
+  ordering_resolutions: number;
+  agent_backtracks: number;
+  deadlocks_resolved: number;
 }
 
 export interface EventLog {
@@ -109,6 +126,64 @@ export interface WarehouseState {
   event_logs: EventLog[];
   reservation_table: ReservationTableSnapshot;
   rules: RuleInfo[];
+  backtracking: BacktrackingState;
+}
+
+export interface SearchTreeNode {
+  id: number;
+  parent: number | null;
+  depth: number;
+  task_id: string;
+  robot_id: string | null;   // null = SKIP
+  cost: number;
+  status: 'expanded' | 'pruned' | 'best';
+}
+
+export interface AllocationSearch {
+  step: number;
+  nodes_expanded: number;
+  branches_pruned: number;
+  backtracks: number;
+  max_depth: number;
+  solutions_found: number;
+  optimal: boolean;
+  greedy_cost: number;
+  best_cost: number;
+  cost_saved: number;
+  search_time_ms: number;
+  assignment: Record<string, string | null>;
+  trace?: SearchTreeNode[];
+}
+
+export interface OrderingSearch {
+  step: number;
+  ca_calls: number;
+  backtracks: number;
+  orderings_tried: number;
+  resolved_by_backtracking: boolean;
+  final_order: string[];
+  unsolvable: string[];
+  budget_exhausted: boolean;
+  search_time_ms: number;
+}
+
+export interface Nogood {
+  robot_id: string | null;   // null = deferred for every robot
+  task_id: string;
+  expires_at: number;
+}
+
+export interface BacktrackingState {
+  allocation_search: AllocationSearch | null;
+  ordering_search: OrderingSearch | null;
+  nogoods: Nogood[];
+  agents?: Array<{
+    robot_id: string;
+    state: RobotState;
+    stuck_steps: number;
+    backtrack_count: number;
+    decision_stack: DecisionPoint[];
+  }>;
 }
 
 export interface ReservationTableSnapshot {

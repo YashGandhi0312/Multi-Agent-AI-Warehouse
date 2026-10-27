@@ -15,11 +15,13 @@ Each robot is a goal-based autonomous agent:
   - It has actuators (moves, picks up, delivers)
   - It has goals (complete assigned delivery tasks)
   - It uses classical AI (A*, rule engine) to select actions
+  - It keeps a stack of choice points (task, route) and backtracks to the
+    most recent one with untried alternatives when it gets stuck
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 class RobotState(str, Enum):
@@ -119,6 +121,13 @@ class Robot:
     total_steps: int = 0
     replan_count: int = 0
     
+    # Deliberation: choice points the agent can backtrack to
+    decision_stack: List[Dict] = field(default_factory=list)
+    avoid_cells: Set[Tuple[int, int]] = field(default_factory=set)
+    stuck_steps: int = 0
+    backtrack_count: int = 0
+    backtrack_cooldown_until: int = 0
+    
     # Metadata
     color_index: int = 0
     
@@ -157,6 +166,24 @@ class Robot:
         """Update the robot's planned navigation path."""
         self.path = path[1:] if path and path[0] == self.position else path
         self.time_path = time_path or []
+    
+    def push_choice(self, level: str, **info):
+        """Record a decision the agent may later revisit (TASK or ROUTE)."""
+        self.decision_stack.append({"level": level, "attempts": 0, **info})
+    
+    def top_choice(self) -> Optional[Dict]:
+        return self.decision_stack[-1] if self.decision_stack else None
+    
+    def pop_choice(self) -> Optional[Dict]:
+        return self.decision_stack.pop() if self.decision_stack else None
+    
+    def commit_task(self):
+        """After pickup the task can no longer be abandoned; the route leg is done."""
+        while self.top_choice() and self.top_choice()["level"] == "ROUTE":
+            self.pop_choice()
+        if self.top_choice():
+            self.top_choice()["committed"] = True
+        self.avoid_cells.clear()
     
     def get_next_position(self) -> Optional[Tuple[int, int]]:
         """Get the next step in the planned path, if any."""
@@ -203,6 +230,8 @@ class Robot:
             self.path = []
             self.time_path = []
             self.tasks_completed += 1
+            self.decision_stack.clear()
+            self.avoid_cells.clear()
             self.transition_to(RobotState.IDLE)
             return delivered_pkg
         return None
@@ -216,6 +245,8 @@ class Robot:
         self.has_package = False
         self.path = []
         self.time_path = []
+        self.decision_stack.clear()
+        self.avoid_cells.clear()
     
     def build_rule_state(self, pending_tasks_exist: bool, package_available: bool,
                          next_cell_blocked: bool = False,
@@ -262,6 +293,17 @@ class Robot:
             "wait_steps": self.wait_steps,
             "total_steps": self.total_steps,
             "replan_count": self.replan_count,
+            "stuck_steps": self.stuck_steps,
+            "backtrack_count": self.backtrack_count,
+            "decision_stack": [
+                {
+                    "level": c["level"],
+                    "label": c.get("task_id") if c["level"] == "TASK" else "route",
+                    "attempts": c["attempts"],
+                    "committed": c.get("committed", False),
+                }
+                for c in self.decision_stack
+            ],
         }
 
 

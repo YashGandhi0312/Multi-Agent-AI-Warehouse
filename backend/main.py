@@ -251,6 +251,10 @@ async def load_scenario(scenario_id: str):
     engine.simulation_step = 0
     engine.event_log.clear()
     engine._task_start_steps.clear()
+    engine.nogoods.clear()
+    engine.deferred_tasks.clear()
+    engine.last_allocation_search = None
+    engine.last_ordering_search = None
     engine._robot_counter = len(robot_ids) + 1
     engine._task_counter = 1
     engine._package_counter = 20
@@ -390,6 +394,27 @@ async def get_cost_matrix():
         engine.warehouse.get_all_obstacles(),
     )
     return {"cost_matrix": matrix, "tasks": [t.task_id for t in tasks]}
+
+
+@app.get("/api/backtracking")
+async def get_backtracking():
+    """
+    Return the latest backtracking search reports (allocation branch & bound
+    with its search-tree trace, priority-order search), active nogoods and
+    each robot's decision stack.
+    """
+    state = engine.get_backtracking_state(include_trace=True)
+    state["agents"] = [
+        {
+            "robot_id": r.robot_id,
+            "state": r.state.value,
+            "stuck_steps": r.stuck_steps,
+            "backtrack_count": r.backtrack_count,
+            "decision_stack": r.to_dict()["decision_stack"],
+        }
+        for r in engine.robots.values()
+    ]
+    return state
 
 
 @app.get("/api/reservation-table")
